@@ -272,6 +272,11 @@ where
             ommers: &block.body().ommers,
             withdrawals: block.body().withdrawals.as_ref().map(Cow::Borrowed),
             timestamp: block.header().timestamp(),
+            // Block-replay path (already-built block): no bridge request blob is attached
+            // here. Bridge calldata is sourced from the engine API via `context_for_payload`;
+            // a re-executed historical block reads requests from the receipts root rather
+            // than re-running the system call.
+            bridge_request: None,
         }
     }
 
@@ -286,6 +291,10 @@ where
             ommers: &[],
             withdrawals: attributes.withdrawals.map(Cow::Owned),
             timestamp: attributes.timestamp,
+            // Local block builder path (not yet wired to the bridge poller). When the CL
+            // builder integration lands the bridge blob will be threaded via the next-block
+            // attributes; for now the EL just won't issue the system call when building.
+            bridge_request: None,
         }
     }
 }
@@ -353,12 +362,32 @@ where
     }
 
     fn context_for_payload<'a>(&self, payload: &'a ExecutionData) -> ExecutionCtxFor<'a, Self> {
+        // 0G bridge: extract the EIP-7685 type-`0x05` entry, if any, and produce ABI calldata
+        // for `Bridge.executeRemoteMessages`. We do NOT enforce fork-activation here — the
+        // actual gating happens inside `system_calls::bridge::transact_bridge_contract_call`,
+        // which checks `is_bridge_active_at_timestamp` and `bridge_contract_address`.
+        // Decoding errors from CL-emitted bytes degrade to `None` (no system call); a
+        // misbehaving CL would already have failed payload validation upstream.
+        let bridge_calldata: Option<Cow<'a, Bytes>> = payload
+            .sidecar
+            .requests()
+            .and_then(|reqs| {
+                reqs.iter().find(|r| r.first() == Some(&reth_0g_bridge::BRIDGE_REQUEST_TYPE))
+            })
+            .and_then(|entry| reth_0g_bridge::decode_bridge_messages(&entry[1..]).ok())
+            .map(|msgs| {
+                let chain_id = self.chain_spec().chain().id();
+                let cd = reth_0g_bridge::encode_execute_remote_messages_calldata(&msgs, chain_id);
+                Cow::Owned(cd)
+            });
+
         EthBlockExecutionCtx {
             parent_hash: payload.parent_hash(),
             parent_beacon_block_root: payload.sidecar.parent_beacon_block_root(),
             ommers: &[],
             withdrawals: payload.payload.withdrawals().map(|w| Cow::Owned(w.clone().into())),
             timestamp: payload.payload.timestamp(),
+            bridge_request: bridge_calldata,
         }
     }
 

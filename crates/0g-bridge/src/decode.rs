@@ -65,13 +65,18 @@ impl BridgeMessage {
     }
 }
 
-/// Variable-length list `List[BridgeMessage, MaxBridgeMessagesPerBlock]` SSZ container.
+/// SSZ Container holding a variable-length `List[BridgeMessage, MaxBridgeMessagesPerBlock]`.
 ///
-/// Encoded as a transparent SSZ list — the cap is enforced post-decode by
-/// [`decode_bridge_messages`] rather than by the SSZ derive (which has no `max_len` attr in
-/// `ethereum_ssz_derive`).
+/// **Wire format must match CL** (`0g-chain-ng/consensus-types/types/bridge_requests.go`):
+/// the field is variable-length, so SSZ requires a 4-byte offset prefix even for an empty
+/// list. Earlier versions of this struct used `#[ssz(struct_behaviour = "transparent")]` —
+/// that flattens to a bare `Vec` (zero offset prefix) which mismatches CL's container
+/// encoding by exactly 4 bytes on every payload (empty list 4 vs 0; one msg 109 vs 105).
+/// Result: every decode fails with `InvalidByteLength` and the bridge system call is
+/// silently skipped on every block. See `docs/integration-tests/findings.md` 2026-04-29
+/// entry. The cap is still enforced post-decode by [`decode_bridge_messages`] rather than
+/// by the SSZ derive (which has no `max_len` attr in `ethereum_ssz_derive`).
 #[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
-#[ssz(struct_behaviour = "transparent")]
 pub struct BridgeRequests {
     /// Decoded messages. Length must be `<= MAX_BRIDGE_MESSAGES_PER_BLOCK`; enforced at
     /// decode time. CL builder pre-sorts by `(SrcChainID, DstChainID, Nonce)`; EL preserves
@@ -181,6 +186,38 @@ mod tests {
         wire.extend_from_slice(&body);
         let decoded = decode_bridge_request(&wire).unwrap();
         assert!(decoded.is_empty());
+    }
+
+    /// Wire compatibility with CL (`0g-chain-ng`'s `karalabe/ssz`-encoded `BridgeRequests`).
+    /// Empty messages must encode to **exactly 4 bytes** — the SSZ container offset prefix
+    /// (`u32 LE = 4`, pointing past the offset itself to where the empty list content starts).
+    /// Earlier `#[ssz(struct_behaviour = "transparent")]` produced 0 bytes here, mismatching CL
+    /// by 4 bytes on every payload. See `docs/integration-tests/findings.md` 2026-04-29 entry.
+    #[test]
+    fn empty_list_wire_format_matches_cl_container() {
+        let body = BridgeRequests { messages: vec![] }.as_ssz_bytes();
+        assert_eq!(
+            body.len(),
+            4,
+            "empty BridgeRequests must serialize to 4 bytes (the variable-list offset); got \
+             {} bytes — likely a regression to a `transparent`/bare-Vec layout.",
+            body.len()
+        );
+        // Offset value = 4 (points just past the offset itself, since the list is empty).
+        assert_eq!(body, [0x04, 0x00, 0x00, 0x00], "offset must be `4` u32 LE");
+    }
+
+    /// Single-message wire compatibility: 4-byte offset + 105 bytes of `BridgeMessage` content.
+    #[test]
+    fn single_message_wire_format_is_offset_plus_105() {
+        let body =
+            BridgeRequests { messages: vec![sample_msg(7)] }.as_ssz_bytes();
+        assert_eq!(
+            body.len(),
+            4 + 105,
+            "one-message BridgeRequests must be 4-byte offset + 105 bytes; got {} bytes",
+            body.len()
+        );
     }
 
     #[test]

@@ -277,6 +277,13 @@ where
             // a re-executed historical block reads requests from the receipts root rather
             // than re-running the system call.
             bridge_request: None,
+            // Replay can't recover the raw SSZ blob (it's not in body, not in receipts, not
+            // in any system contract storage — the 0xf0 entry is CL-pushed only). Skipping the
+            // 0xf0 push in `EthBlockExecutor::finish` is byte-equivalent to the pre-fix replay
+            // path — the 0G `validate_block_post_execution` is lenient (overwrites header
+            // rather than diffs), so the in-memory header reconstruction differs from the
+            // sealed db value harmlessly. See plan §6.2 of the fix correctness analysis.
+            bridge_request_raw: None,
         }
     }
 
@@ -295,13 +302,42 @@ where
         // failed CL-side payload validation upstream, but treating it as a build-time hard
         // error would prevent the EL from making any progress at all.
         let bridge_calldata = attributes.bridge_request.as_ref().and_then(|raw| {
-            reth_0g_bridge::decode_bridge_messages(raw).ok().map(|msgs| {
-                let chain_id = self.chain_spec().chain().id();
-                Cow::Owned(reth_0g_bridge::encode_execute_remote_messages_calldata(
-                    &msgs, chain_id,
-                ))
-            })
+            match reth_0g_bridge::decode_bridge_messages(raw) {
+                Ok(msgs) => {
+                    let chain_id = self.chain_spec().chain().id();
+                    let cd = reth_0g_bridge::encode_execute_remote_messages_calldata(&msgs, chain_id);
+                    tracing::debug!(
+                        target: "0g::evm::bridge",
+                        ssz_len = raw.len(),
+                        msg_count = msgs.len(),
+                        calldata_len = cd.len(),
+                        "context_for_next_block: decoded bridge SSZ to ABI calldata (build path)"
+                    );
+                    Some(Cow::Owned(cd))
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "0g::evm::bridge",
+                        ?err,
+                        ssz_len = raw.len(),
+                        "context_for_next_block: failed to decode bridge SSZ blob — system call will be skipped"
+                    );
+                    None
+                }
+            }
         });
+
+        // 0G: Forward the original SSZ blob unchanged so `EthBlockExecutor::finish` can append
+        // it as the `0xf0` entry of the EIP-7685 requests list. This is what makes the proposer-
+        // built sealed `block.header.requests_hash` cover the bridge entry — a precondition for
+        // the CL's re-assembled block hash to match `payload.block_hash`. See plan §1.6.4.
+        let bridge_request_raw = attributes.bridge_request.clone().map(Cow::Owned);
+        tracing::debug!(
+            target: "0g::evm::bridge",
+            has_calldata = bridge_calldata.is_some(),
+            has_raw = bridge_request_raw.is_some(),
+            "context_for_next_block: bridge ctx populated"
+        );
 
         EthBlockExecutionCtx {
             parent_hash: parent.hash(),
@@ -310,6 +346,7 @@ where
             withdrawals: attributes.withdrawals.map(Cow::Owned),
             timestamp: attributes.timestamp,
             bridge_request: bridge_calldata,
+            bridge_request_raw,
         }
     }
 }
@@ -383,18 +420,57 @@ where
         // which checks `is_bridge_active_at_timestamp` and `bridge_contract_address`.
         // Decoding errors from CL-emitted bytes degrade to `None` (no system call); a
         // misbehaving CL would already have failed payload validation upstream.
-        let bridge_calldata: Option<Cow<'a, Bytes>> = payload
+        // Locate the `0xf0` entry once and reuse for both fields below.
+        let sidecar_requests_count =
+            payload.sidecar.requests().map_or(0, |r| r.iter().count());
+        let bridge_entry: Option<&[u8]> = payload
             .sidecar
             .requests()
             .and_then(|reqs| {
                 reqs.iter().find(|r| r.first() == Some(&reth_0g_bridge::BRIDGE_REQUEST_TYPE))
             })
-            .and_then(|entry| reth_0g_bridge::decode_bridge_messages(&entry[1..]).ok())
-            .map(|msgs| {
-                let chain_id = self.chain_spec().chain().id();
-                let cd = reth_0g_bridge::encode_execute_remote_messages_calldata(&msgs, chain_id);
-                Cow::Owned(cd)
-            });
+            .map(|entry| &entry[1..]);
+
+        let bridge_calldata: Option<Cow<'a, Bytes>> = bridge_entry
+            .and_then(|raw| match reth_0g_bridge::decode_bridge_messages(raw) {
+                Ok(msgs) => {
+                    let chain_id = self.chain_spec().chain().id();
+                    let cd = reth_0g_bridge::encode_execute_remote_messages_calldata(&msgs, chain_id);
+                    tracing::debug!(
+                        target: "0g::evm::bridge",
+                        ssz_len = raw.len(),
+                        msg_count = msgs.len(),
+                        calldata_len = cd.len(),
+                        "context_for_payload: decoded bridge SSZ to ABI calldata (verify path)"
+                    );
+                    Some(cd)
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "0g::evm::bridge",
+                        ?err,
+                        ssz_len = raw.len(),
+                        "context_for_payload: failed to decode bridge SSZ blob — system call will be skipped"
+                    );
+                    None
+                }
+            })
+            .map(Cow::Owned);
+
+        // 0G: Carry the same raw SSZ bytes the CL emitted in the 0xf0 entry. On the verifier
+        // path `EthBlockExecutor::finish` re-pushes them so its returned `requests` matches
+        // the proposer-built sealed header's `requests_hash`. See plan §1.6.4.
+        let bridge_request_raw: Option<Cow<'a, Bytes>> =
+            bridge_entry.map(|raw| Cow::Owned(Bytes::copy_from_slice(raw)));
+
+        tracing::debug!(
+            target: "0g::evm::bridge",
+            sidecar_requests_count,
+            has_bridge_entry = bridge_entry.is_some(),
+            has_calldata = bridge_calldata.is_some(),
+            has_raw = bridge_request_raw.is_some(),
+            "context_for_payload: bridge ctx populated"
+        );
 
         EthBlockExecutionCtx {
             parent_hash: payload.parent_hash(),
@@ -403,6 +479,7 @@ where
             withdrawals: payload.payload.withdrawals().map(|w| Cow::Owned(w.clone().into())),
             timestamp: payload.payload.timestamp(),
             bridge_request: bridge_calldata,
+            bridge_request_raw,
         }
     }
 

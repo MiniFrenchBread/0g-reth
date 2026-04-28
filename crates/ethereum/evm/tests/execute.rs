@@ -951,6 +951,10 @@ mod bridge_tests {
             withdrawals: Some(Cow::Owned(Withdrawals::new(vec![]))),
             timestamp: header.timestamp,
             bridge_request: bridge_calldata.map(Cow::Owned),
+            // This test exercises only the bridge system call's storage side-effects, not the
+            // returned `requests` list. `None` here keeps the test focused; the 0xf0 push path
+            // is exercised end-to-end by §2.F integration tests.
+            bridge_request_raw: None,
         };
 
         let executor = provider.block_executor_factory().create_executor(evm, ctx);
@@ -1036,6 +1040,97 @@ mod bridge_tests {
             slot0, expected_first_word,
             "bridge calldata first 32 bytes must match what we encoded"
         );
+    }
+
+    /// Runs an empty post-Prague block through the executor and returns `BlockExecutionResult.requests`
+    /// so callers can assert on the EIP-7685 entries `EthBlockExecutor::finish` produced.
+    ///
+    /// Distinct from [`run_with_bridge_ctx`] which only inspects bridge-contract storage. These
+    /// tests target the `0xf0` entry append path introduced to fix the §2.F block-hash mismatch
+    /// (see `docs/integration-tests/findings.md` 2026-04-29 entry).
+    fn finish_requests_with_raw(
+        spec: Arc<ChainSpec>,
+        bridge_calldata: Option<Bytes>,
+        bridge_request_raw: Option<Bytes>,
+    ) -> alloy_eips::eip7685::Requests {
+        let provider = EthEvmConfig::new(spec.clone());
+        let header = Header {
+            timestamp: 100,
+            number: 1,
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(B256::ZERO),
+            ..Header::default()
+        };
+        let db = database_with_bridge_stub();
+        let mut state = State::builder().with_database(db).with_bundle_update().build();
+        let evm = provider.evm_for_block(&mut state, &header);
+        let ctx = EthBlockExecutionCtx {
+            parent_hash: header.parent_hash,
+            parent_beacon_block_root: header.parent_beacon_block_root,
+            ommers: &[],
+            withdrawals: Some(Cow::Owned(Withdrawals::new(vec![]))),
+            timestamp: header.timestamp,
+            bridge_request: bridge_calldata.map(Cow::Owned),
+            bridge_request_raw: bridge_request_raw.map(Cow::Owned),
+        };
+        let mut executor = provider.block_executor_factory().create_executor(evm, ctx);
+        BlockExecutor::apply_pre_execution_changes(&mut executor)
+            .expect("pre-execution should succeed");
+        let (_evm, result) = BlockExecutor::finish(executor).expect("finish should succeed");
+        result.requests
+    }
+
+    #[test]
+    fn finish_appends_0xf0_entry_when_raw_attached() {
+        // Prague active + bridge_request_raw=Some(bytes) → returned `requests` must end with
+        // `0xf0 || bytes`. This is the build-path invariant: `EthBlockAssembler` consumes this
+        // `requests` to compute `requests_hash` for the sealed block header — if the entry is
+        // missing here, the proposer-built `block.block_hash` will not match the wire requests
+        // list and the CL rejects the block (the bug §2.F caught).
+        let spec = build_chain_spec(true);
+        let raw = Bytes::from_static(&[0x04, 0x00, 0x00, 0x00]); // SSZ empty-list sentinel (4 bytes)
+        let requests = finish_requests_with_raw(spec, None, Some(raw.clone()));
+        let entries: Vec<&[u8]> = requests.iter().map(|b| b.as_ref()).collect();
+        assert!(
+            entries.iter().any(|e| e.first() == Some(&0xf0) && &e[1..] == raw.as_ref()),
+            "post-Prague + bridge_request_raw=Some must produce 0xf0||bytes entry; got {:?}",
+            entries
+        );
+    }
+
+    #[test]
+    fn finish_omits_0xf0_entry_when_raw_none() {
+        // Prague active but bridge_request_raw=None → no 0xf0 entry emitted. This is the replay
+        // path (`context_for_block` always sets None) and any pre-Bridge-fork scenario.
+        let spec = build_chain_spec(true);
+        let requests = finish_requests_with_raw(spec, None, None);
+        let entries: Vec<&[u8]> = requests.iter().map(|b| b.as_ref()).collect();
+        assert!(
+            entries.iter().all(|e| e.first() != Some(&0xf0)),
+            "bridge_request_raw=None must NOT push 0xf0 entry; got {:?}",
+            entries
+        );
+    }
+
+    #[test]
+    fn finish_appends_0xf0_after_pectra_types() {
+        // EIP-7685 requires monotonically increasing type bytes. Our 0xf0 entry must come
+        // strictly after any 0x00/0x01/0x02 entries the standard EIP-6110/7002/7251 path
+        // produces. The empty-block test fixture here has no deposits/withdrawals/consolidations,
+        // so the runtime ordering check trivially holds — but we lock in the contract by
+        // confirming 0xf0 is the **last** entry whenever it's emitted.
+        let spec = build_chain_spec(true);
+        let raw = Bytes::from_static(&[0x04, 0x00, 0x00, 0x00, 0xDE, 0xAD]);
+        let requests = finish_requests_with_raw(spec, None, Some(raw));
+        let last = requests.iter().last().expect("at least one request entry");
+        assert_eq!(last.first(), Some(&0xf0), "0xf0 entry must be last; got {:?}", last);
+        // Sanity: every other entry's type byte (if any) is < 0xf0.
+        let mut prev = 0u8;
+        for entry in requests.iter() {
+            let ty = entry.first().copied().expect("non-empty entry");
+            assert!(ty > prev, "type bytes not strictly ascending: {ty:#x} after {prev:#x}");
+            prev = ty;
+        }
     }
 
     // Silence dead-code checks in this submodule for utilities used selectively.

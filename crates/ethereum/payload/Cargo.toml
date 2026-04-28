@@ -25,7 +25,6 @@ reth-payload-primitives.workspace = true
 reth-basic-payload-builder.workspace = true
 reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
-reth-0g-bridge.workspace = true
 reth-errors.workspace = true
 reth-chainspec.workspace = true
 reth-payload-validator.workspace = true

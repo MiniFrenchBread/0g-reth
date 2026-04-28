@@ -386,29 +386,17 @@ where
 
     let BlockBuilderOutcome { execution_result, block, .. } = builder.finish(&state_provider)?;
 
+    // 0G: `execution_result.requests` already contains the `0xf0` bridge entry (if any) —
+    // `EthBlockExecutor::finish` appends it from `EthBlockExecutionCtx.bridge_request_raw`
+    // before `EthBlockAssembler::assemble_block` reads `requests` to compute `requests_hash`.
+    // That is the **only** correct place to push: doing it here, post-`builder.finish()`,
+    // would leave the sealed `block.header.requests_hash` covering only deposits/withdrawals/
+    // consolidations while the wire response includes 0xf0, and the CL's re-assembled block
+    // hash would diverge from `payload.block_hash` (the bug §2.F caught in 2026-04-29).
+    // See `docs/plans/cross-chain-bridge.md` §1.6.4 / §2.A.10.
     let requests = chain_spec
         .is_prague_active_at_timestamp(attributes.timestamp)
-        .then_some(execution_result.requests)
-        .map(|mut requests| {
-            // 0G: append the EIP-7685 type-`0xf0` bridge entry as the last item in the
-            // payload's executionRequests when CL forwarded a bridge SSZ blob via
-            // `engine_forkchoiceUpdatedV4.payloadAttributes.bridgeRequests`. The bytes are
-            // the **same** SSZ blob CL passed in (NOT recomputed by the EL) so the proposer
-            // and the verifier compute the same `requestsHash`. See
-            // `docs/plans/cross-chain-bridge.md` §1.6.4 / §2.A.10.
-            //
-            // Strict-ascending type-byte ordering is preserved: `0xf0` > `0x00`/`0x01`/`0x02`
-            // (deposits/withdrawals/consolidations) so appending after them is correct. We
-            // skip empty (`b""`) blobs so the verifier's `[0x00..0x02]`-only requestsHash for
-            // post-Bridge blocks with no messages still matches CL — CL must NOT include the
-            // `0xf0` entry when the SSZ list is the 4-byte empty-list sentinel only if it
-            // matches its own emission policy; today CL always includes the entry post-fork
-            // even when the message list is empty, so we mirror that.
-            if let Some(bytes) = attributes.bridge_requests.as_ref() {
-                requests.push_request_with_type(reth_0g_bridge::BRIDGE_REQUEST_TYPE, bytes.clone());
-            }
-            requests
-        });
+        .then_some(execution_result.requests);
 
     let sealed_block = Arc::new(block.sealed_block().clone());
     debug!(target: "payload_builder", id=%attributes.id, sealed_block_header = ?sealed_block.sealed_header(), "sealed built block");

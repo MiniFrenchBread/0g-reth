@@ -30,6 +30,7 @@ alloy-consensus.workspace = true
 alloy-rpc-types-engine.workspace = true
 
 # Misc
+tracing.workspace = true
 parking_lot = { workspace = true, optional = true }
 derive_more = { workspace = true, optional = true }
 

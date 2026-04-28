@@ -285,16 +285,31 @@ where
         parent: &SealedHeader,
         attributes: Self::NextBlockEnvCtx,
     ) -> EthBlockExecutionCtx<'_> {
+        // 0G: decode the SSZ `BridgeRequests` blob the CL forwarded via
+        // `engine_forkchoiceUpdatedV4.payloadAttributes.bridgeRequests` and re-encode it as
+        // ABI calldata for `Bridge.executeRemoteMessages(InboundMessage[])`. Fork-activation
+        // and bridge-address gating happen inside
+        // `system_calls::bridge::transact_bridge_contract_call`; if either is closed, the
+        // calldata is computed but never executed (still cheap — a few KB encode).
+        // Decoding errors degrade to `None` (no system call); a malformed blob would have
+        // failed CL-side payload validation upstream, but treating it as a build-time hard
+        // error would prevent the EL from making any progress at all.
+        let bridge_calldata = attributes.bridge_request.as_ref().and_then(|raw| {
+            reth_0g_bridge::decode_bridge_messages(raw).ok().map(|msgs| {
+                let chain_id = self.chain_spec().chain().id();
+                Cow::Owned(reth_0g_bridge::encode_execute_remote_messages_calldata(
+                    &msgs, chain_id,
+                ))
+            })
+        });
+
         EthBlockExecutionCtx {
             parent_hash: parent.hash(),
             parent_beacon_block_root: attributes.parent_beacon_block_root,
             ommers: &[],
             withdrawals: attributes.withdrawals.map(Cow::Owned),
             timestamp: attributes.timestamp,
-            // Local block builder path (not yet wired to the bridge poller). When the CL
-            // builder integration lands the bridge blob will be threaded via the next-block
-            // attributes; for now the EL just won't issue the system call when building.
-            bridge_request: None,
+            bridge_request: bridge_calldata,
         }
     }
 }
@@ -362,7 +377,7 @@ where
     }
 
     fn context_for_payload<'a>(&self, payload: &'a ExecutionData) -> ExecutionCtxFor<'a, Self> {
-        // 0G bridge: extract the EIP-7685 type-`0x05` entry, if any, and produce ABI calldata
+        // 0G bridge: extract the EIP-7685 type-`0xf0` entry, if any, and produce ABI calldata
         // for `Bridge.executeRemoteMessages`. We do NOT enforce fork-activation here — the
         // actual gating happens inside `system_calls::bridge::transact_bridge_contract_call`,
         // which checks `is_bridge_active_at_timestamp` and `bridge_contract_address`.

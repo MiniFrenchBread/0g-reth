@@ -167,6 +167,11 @@ where
                 gas_limit: builder_config.gas_limit(parent_header.gas_limit),
                 parent_beacon_block_root: attributes.parent_beacon_block_root(),
                 withdrawals: Some(attributes.withdrawals().clone()),
+                // 0G: forward the SSZ blob the CL sent on `engine_forkchoiceUpdatedV4`. The
+                // EL config's `context_for_next_block` decodes this into ABI calldata for
+                // `Bridge.executeRemoteMessages` so the bridge system call fires inside
+                // `EthBlockExecutor::finish()` during local block building.
+                bridge_request: attributes.bridge_requests.clone(),
             },
         )
         .map_err(PayloadBuilderError::other)?;
@@ -383,7 +388,27 @@ where
 
     let requests = chain_spec
         .is_prague_active_at_timestamp(attributes.timestamp)
-        .then_some(execution_result.requests);
+        .then_some(execution_result.requests)
+        .map(|mut requests| {
+            // 0G: append the EIP-7685 type-`0xf0` bridge entry as the last item in the
+            // payload's executionRequests when CL forwarded a bridge SSZ blob via
+            // `engine_forkchoiceUpdatedV4.payloadAttributes.bridgeRequests`. The bytes are
+            // the **same** SSZ blob CL passed in (NOT recomputed by the EL) so the proposer
+            // and the verifier compute the same `requestsHash`. See
+            // `docs/plans/cross-chain-bridge.md` §1.6.4 / §2.A.10.
+            //
+            // Strict-ascending type-byte ordering is preserved: `0xf0` > `0x00`/`0x01`/`0x02`
+            // (deposits/withdrawals/consolidations) so appending after them is correct. We
+            // skip empty (`b""`) blobs so the verifier's `[0x00..0x02]`-only requestsHash for
+            // post-Bridge blocks with no messages still matches CL — CL must NOT include the
+            // `0xf0` entry when the SSZ list is the 4-byte empty-list sentinel only if it
+            // matches its own emission policy; today CL always includes the entry post-fork
+            // even when the message list is empty, so we mirror that.
+            if let Some(bytes) = attributes.bridge_requests.as_ref() {
+                requests.push_request_with_type(reth_0g_bridge::BRIDGE_REQUEST_TYPE, bytes.clone());
+            }
+            requests
+        });
 
     let sealed_block = Arc::new(block.sealed_block().clone());
     debug!(target: "payload_builder", id=%attributes.id, sealed_block_header = ?sealed_block.sealed_header(), "sealed built block");

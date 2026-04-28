@@ -1,9 +1,10 @@
 //! 0G cross-chain bridge primitives for the EL.
 //!
-//! Implements the on-wire types and conversions for EIP-7685 request type byte `0x05`. The
-//! CL emits a list of [`BridgeMessage`] items as SSZ bytes; this crate decodes them and
-//! re-encodes the subset that the destination-chain Bridge contract consumes as ABI calldata
-//! for `Bridge.executeRemoteMessages(InboundMessage[])`.
+//! Implements the on-wire types and conversions for EIP-7685 request type byte `0xf0`
+//! (private 0G namespace; see `docs/plans/cross-chain-bridge.md` §1.6.5). The CL emits a list
+//! of [`BridgeMessage`] items as SSZ bytes; this crate decodes them and re-encodes the subset
+//! that the destination-chain Bridge contract consumes as ABI calldata for
+//! `Bridge.executeRemoteMessages(InboundMessage[])`.
 //!
 //! See `docs/plans/bridge-schemas.md` (the cross-stream schema freeze) for the canonical
 //! field definitions, byte order, and length caps.
@@ -31,9 +32,12 @@ pub use encode::{encode_execute_remote_messages_calldata, InboundMessage};
 
 /// EIP-7685 request type byte for 0G bridge inbound messages.
 ///
-/// Pinned in `docs/plans/bridge-schemas.md` § "共享常量". Cross-stream value: CL emits with
-/// this byte prepended; EL strips it before SSZ-decoding the body.
-pub const BRIDGE_REQUEST_TYPE: u8 = 0x05;
+/// Lives in the private 0G namespace `0xf0..=0xfe` to avoid colliding with future Ethereum
+/// upstream request types (`0x03+` are reserved for new EIP standards). See
+/// `docs/plans/cross-chain-bridge.md` §1.6.5 and `docs/plans/bridge-schemas.md` § "共享常量"
+/// for the decision rationale and cross-stream pin. CL emits with this byte prepended; EL
+/// strips it before SSZ-decoding the body.
+pub const BRIDGE_REQUEST_TYPE: u8 = 0xf0;
 
 /// Hard cap on the number of [`BridgeMessage`] items the EL will accept per block.
 ///

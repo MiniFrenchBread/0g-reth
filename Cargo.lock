@@ -8410,6 +8410,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-engine",
+ "reth-0g-bridge",
  "reth-basic-payload-builder",
  "reth-chainspec",
  "reth-consensus-common",
@@ -9063,6 +9064,7 @@ dependencies = [
  "alloy-consensus",
  "alloy-contract",
  "alloy-eips",
+ "alloy-evm",
  "alloy-genesis",
  "alloy-network",
  "alloy-primitives",
@@ -9106,6 +9108,7 @@ dependencies = [
  "reth-transaction-pool",
  "revm",
  "serde_json",
+ "thiserror 2.0.17",
  "tokio",
 ]
 

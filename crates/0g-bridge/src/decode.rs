@@ -1,4 +1,4 @@
-//! SSZ decoding of EIP-7685 type-`0x05` bridge request payload.
+//! SSZ decoding of EIP-7685 type-`0xf0` bridge request payload.
 
 use crate::{BRIDGE_REQUEST_TYPE, MAX_BRIDGE_MESSAGES_PER_BLOCK};
 use alloc::vec::Vec;
@@ -79,11 +79,11 @@ pub struct BridgeRequests {
     pub messages: Vec<BridgeMessage>,
 }
 
-/// Errors that can occur when decoding a type-`0x05` request payload.
+/// Errors that can occur when decoding a type-`0xf0` request payload.
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeDecodeError {
-    /// Type byte was missing or did not match `0x05`.
-    #[error("expected EIP-7685 request type byte 0x05, got 0x{0:02x}")]
+    /// Type byte was missing or did not match [`BRIDGE_REQUEST_TYPE`] (`0xf0`).
+    #[error("expected EIP-7685 request type byte 0xf0, got 0x{0:02x}")]
     WrongTypeByte(u8),
 
     /// Empty payload (no type byte).
@@ -112,13 +112,13 @@ impl From<DecodeError> for BridgeDecodeError {
     }
 }
 
-/// Decodes a full EIP-7685 type-`0x05` request entry: leading type byte stripped, then SSZ
+/// Decodes a full EIP-7685 type-`0xf0` request entry: leading type byte stripped, then SSZ
 /// container body, then length cap and mode-byte sanity checks.
 ///
 /// The expected wire format is:
 ///
 /// ```text
-/// request_bytes = 0x05 || ssz_bytes(BridgeRequests)
+/// request_bytes = 0xf0 || ssz_bytes(BridgeRequests)
 /// ```
 ///
 /// Note: this function expects the **entire** entry including the leading type byte. Callers
@@ -186,10 +186,12 @@ mod tests {
     #[test]
     fn rejects_wrong_type_byte() {
         let body = BridgeRequests { messages: vec![sample_msg(1)] }.as_ssz_bytes();
-        let mut wire = vec![0x04];
+        // `0x05` was the original (pre-§1.6.5) bridge type byte; assert the new `0xf0` decoder
+        // rejects it cleanly so a stale CL wouldn't be silently accepted by an upgraded EL.
+        let mut wire = vec![0x05];
         wire.extend_from_slice(&body);
         let err = decode_bridge_request(&wire).unwrap_err();
-        assert!(matches!(err, BridgeDecodeError::WrongTypeByte(0x04)), "got {err:?}");
+        assert!(matches!(err, BridgeDecodeError::WrongTypeByte(0x05)), "got {err:?}");
     }
 
     #[test]
